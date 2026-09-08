@@ -20,8 +20,10 @@ tubs will show a different subset of the channels listed below.
 
 ## Discovery
 
-This binding does not support auto-discovery. Things must be added manually with the host/IP address
-of the Balboa Wi-Fi module.
+The binding can discover Balboa Wi-Fi modules on the local network: it broadcasts a UDP discovery
+request on port 30303, which every reachable module answers directly. Discovery only finds modules on
+the same local network segment as the openHAB server. Things can also still be added manually with the
+host/IP address of the Balboa Wi-Fi module.
 
 ## Thing Configuration
 
@@ -29,8 +31,12 @@ of the Balboa Wi-Fi module.
 |---------------------|---------|----------|---------|----------------------------------------------------------------------|
 | `host`              | text    | yes      | -       | Hostname or IP address of the Balboa Wi-Fi module                   |
 | `port`              | integer | yes      | 4257    | TCP port of the Balboa Wi-Fi module                                  |
-| `reconnectInterval` | integer | yes      | 30      | Seconds to wait before attempting to reconnect after a disconnect    |
+| `reconnectInterval` | integer | yes      | 30      | Seconds before the first reconnect attempt after a disconnect; further attempts back off exponentially, capped at 10 minutes |
 | `pollingInterval`   | integer | yes      | 60      | Seconds between polling requests sent to keep the connection alive   |
+
+If the unit stops responding without properly closing the connection (for example if its Wi-Fi module loses
+power), the binding notices that no data has been received for a while, closes the connection itself and goes
+through the same reconnect logic as for a normal disconnect.
 
 ### `balboa.things` Example
 

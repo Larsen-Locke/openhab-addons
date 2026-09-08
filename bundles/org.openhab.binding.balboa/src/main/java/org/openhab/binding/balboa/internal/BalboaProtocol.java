@@ -53,6 +53,10 @@ public class BalboaProtocol {
     private Reader reader = new Reader();
     private boolean babble = false;
     private Status status = Status.INITIAL;
+    // Timestamp of the last time data was received from the unit. A TCP peer that disappears without sending a
+    // FIN/RST (e.g. its Wi-Fi module is powered off) is not detected by the socket itself: reads simply never
+    // complete. Callers use this to notice such a "silently dead" connection and force a reconnect.
+    private volatile long lastActivity = System.currentTimeMillis();
 
     /**
      * Constructor for {@link BalboaProtocol} with a given {@link BalboaProtocol.Handler}
@@ -276,17 +280,16 @@ public class BalboaProtocol {
             // Queue the item if writing is already in progress
             if (writeInProgress) {
                 queue.add(buffer);
-            } else {
+            } else if (socket != null) {
                 // Otherwise start writing
                 logger.trace("Write session started");
                 writeInProgress = true;
-                if (socket != null) {
-                    socket.write(buffer, buffer, this);
-                } else {
-                    // Abort if we are not connected
-                    writeInProgress = false;
-                    throw new IllegalStateException("Cannot send message while not connected");
-                }
+                socket.write(buffer, buffer, this);
+            } else {
+                // Not connected right now (e.g. offline or reconnecting). There is nothing to send this on, and
+                // whoever triggered this (e.g. a command sent to a channel while the unit is unreachable) has no
+                // way to react to an exception here, so just drop the message instead of failing loudly.
+                logger.debug("Discarding outgoing message, not connected");
             }
         }
 
@@ -365,6 +368,9 @@ public class BalboaProtocol {
                 return;
             }
 
+            // Any successful read, however small, proves the unit is still there.
+            lastActivity = System.currentTimeMillis();
+
             // Limit the buffer at the end of the read and rewind to the start of the buffer.
             readBuffer.limit(readBuffer.position());
             readBuffer.rewind();
@@ -380,15 +386,19 @@ public class BalboaProtocol {
                 // The first byte must be a separator
                 byte startByte = readBuffer.get();
                 if (startByte != MESSAGE_SEPARATOR) {
-                    logger.debug("Message did not start with {}, got {}", MESSAGE_SEPARATOR, startByte);
-                    // Discard the whole buffer in this case
-                    readBuffer.position(0);
-                    readBuffer.limit(0);
-                    break;
+                    logger.debug("Message did not start with {}, got {}, resynchronizing", MESSAGE_SEPARATOR,
+                            startByte);
+                    // A single stray or dropped byte should not cost us every message that follows it: look for
+                    // the next separator instead of discarding everything currently buffered.
+                    resync(readBuffer.position());
+                    continue;
                 }
 
-                // Second byte is the length byte
-                int messageLength = readBuffer.get();
+                // Second byte is the length byte. Read it as an unsigned value (0-255): a plain byte-to-int
+                // widening would sign-extend anything with the high bit set into a negative number, which would
+                // then bypass the "enough data buffered" check below and blow up array/index arithmetic further
+                // down for what is just a garbled or misaligned message.
+                int messageLength = readBuffer.get() & 0xFF;
 
                 // Make sure the full message is in the buffer
                 if (messageLength > readBuffer.remaining()) {
@@ -416,11 +426,13 @@ public class BalboaProtocol {
 
                 // Check that there is a separator at the end.
                 if (message[message.length - 1] != MESSAGE_SEPARATOR) {
-                    logger.debug("Message did not end with {}", MESSAGE_SEPARATOR);
-                    // Discard the whole buffer in this case
-                    readBuffer.position(0);
-                    readBuffer.limit(0);
-                    break;
+                    logger.debug("Message did not end with {}, resynchronizing", MESSAGE_SEPARATOR);
+                    // The length byte was apparently wrong (garbled or misaligned data). Go back to right after
+                    // the separator that started this bogus message and look for the next real one instead of
+                    // discarding everything currently buffered.
+                    readBuffer.reset();
+                    resync(readBuffer.position() + 1);
+                    continue;
                 }
 
                 // Length must be at least 5 (3 bytes message type, crc and separator)
@@ -465,6 +477,24 @@ public class BalboaProtocol {
         }
 
         /**
+         * Resynchronizes the buffer on the next message separator found from (and including) the given position,
+         * discarding everything before it. If none is found, the whole buffer is discarded and parsing resumes
+         * once more data has arrived.
+         *
+         * @param from the buffer position to start searching from
+         */
+        private void resync(int from) {
+            for (int i = from; i < readBuffer.limit(); i++) {
+                if (readBuffer.get(i) == MESSAGE_SEPARATOR) {
+                    readBuffer.position(i);
+                    return;
+                }
+            }
+            readBuffer.position(0);
+            readBuffer.limit(0);
+        }
+
+        /**
          * Starts a {@link BalboaProtocol.Reader}
          *
          */
@@ -493,6 +523,16 @@ public class BalboaProtocol {
     private void setStatus(Status status, String detail) {
         this.status = status;
         handler.onStateChange(status, detail);
+    }
+
+    /**
+     * Returns how long it has been since data was last received from the unit.
+     *
+     * @return milliseconds since the last successful read, measured from when the current (or most recent) connect
+     *         attempt was started if nothing has been received yet.
+     */
+    public long getMillisSinceLastActivity() {
+        return System.currentTimeMillis() - lastActivity;
     }
 
     /**
@@ -526,6 +566,9 @@ public class BalboaProtocol {
         if (socket != null) {
             disconnect();
         }
+
+        // Do not count the time spent disconnected against the freshly (re)started connection.
+        lastActivity = System.currentTimeMillis();
 
         // Resolve the host address
         InetSocketAddress hostAddress = null;
@@ -567,7 +610,10 @@ public class BalboaProtocol {
 
                 @Override
                 public void failed(@Nullable Throwable exc, BalboaProtocol bp) {
-                    // Failed to connect, report the error
+                    // Failed to connect. The unit is simply unreachable right now (powered off, network outage,
+                    // ...) rather than misconfigured, so treat it like any other disconnect (OFFLINE), not as a
+                    // configuration ERROR - that keeps the reconnect loop going without flapping the Thing status
+                    // between OFFLINE and a configuration error on every failed retry.
                     String detail;
                     if (exc == null) {
                         detail = "Connection Failed";
@@ -575,7 +621,7 @@ public class BalboaProtocol {
                         detail = String.format("Connection Failed: %s", exc.getMessage());
                     }
                     logger.debug("{}", detail);
-                    setStatus(Status.ERROR, detail);
+                    setStatus(Status.OFFLINE, detail);
                     // Mark the socket as not valid and reset the reader/writer
                     socket = null;
                     reader.reset();

@@ -14,6 +14,7 @@ package org.openhab.binding.balboa.internal;
 
 import java.util.HashMap;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
 import javax.measure.quantity.Temperature;
@@ -63,6 +64,8 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
     private ReconnectJob reconnectJob = new ReconnectJob();
     // This is used to poll the unit for non-broadcast information and keeping the connection alive.
     private PollingJob pollingJob = new PollingJob();
+    // This detects a unit that has silently disappeared (no FIN/RST, e.g. powered off) and forces a reconnect.
+    private WatchdogJob watchdogJob = new WatchdogJob();
 
     /**
      * Helper class providing a thread safe reconnection mechanism.
@@ -71,8 +74,15 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
      *
      */
     private class ReconnectJob implements Runnable {
+        // Reconnect delays grow exponentially from config.reconnectInterval, capped at this many seconds, so a
+        // long-lasting outage does not keep the binding hammering the unit (or the network) forever.
+        private static final long MAX_RECONNECT_DELAY_SECONDS = 600;
+        // The backoff exponent is also capped, mainly to avoid overflow for unusual configurations.
+        private static final int MAX_BACKOFF_SHIFT = 8;
+
         private @Nullable ScheduledFuture<?> job;
         private boolean enabled = false;
+        private int attempt = 0;
 
         /**
          * Enables the reconnection mechanism
@@ -97,12 +107,27 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
         }
 
         /**
-         * Schedules a reconnect if enabled and not already pending.
+         * Resets the backoff so that the next reconnect attempt (if any) starts again at
+         * {@code config.reconnectInterval}. Called once the connection is confirmed to be online again.
+         */
+        public synchronized void resetBackoff() {
+            attempt = 0;
+        }
+
+        /**
+         * Schedules a reconnect if enabled and not already pending. Successive attempts back off exponentially
+         * from {@code config.reconnectInterval} (capped at {@link #MAX_RECONNECT_DELAY_SECONDS}), with a little
+         * random jitter added so repeated failures do not keep retrying in lockstep.
          */
         public synchronized void schedule() {
             if (enabled && job == null && config.reconnectInterval > 0) {
-                job = scheduler.schedule(this, config.reconnectInterval, TimeUnit.SECONDS);
-                logger.debug("Reconnection attempt in {} seconds", config.reconnectInterval);
+                long delay = Math.min(config.reconnectInterval * (1L << Math.min(attempt, MAX_BACKOFF_SHIFT)),
+                        MAX_RECONNECT_DELAY_SECONDS);
+                delay += ThreadLocalRandom.current().nextInt(0, 3);
+                attempt++;
+
+                job = scheduler.schedule(this, delay, TimeUnit.SECONDS);
+                logger.debug("Reconnection attempt {} in {} seconds", attempt, delay);
             }
         }
 
@@ -157,6 +182,57 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
             logger.trace("Polling the unit");
             // Send an information request
             protocol.sendMessage(new BalboaMessage.SettingsRequestMessage(SettingsType.INFORMATION));
+        }
+    }
+
+    /**
+     * Helper class detecting a unit that has gone silent without the socket noticing (no FIN/RST is sent if e.g. the
+     * Wi-Fi module simply loses power), by periodically checking how long it has been since anything was received.
+     *
+     * @author Carsten Mogge
+     *
+     */
+    private class WatchdogJob implements Runnable {
+        // How often to check for staleness.
+        private static final long CHECK_INTERVAL_SECONDS = 30;
+        // The unit normally streams status updates several times per second while connected, so anything longer
+        // than this without receiving a single byte means the connection is effectively dead.
+        private static final long COMMUNICATION_TIMEOUT_MILLIS = 90_000;
+
+        private @Nullable ScheduledFuture<?> job;
+
+        /**
+         * Starts the watchdog if not already active.
+         */
+        public synchronized void start() {
+            if (job == null) {
+                job = scheduler.scheduleWithFixedDelay(this, CHECK_INTERVAL_SECONDS, CHECK_INTERVAL_SECONDS,
+                        TimeUnit.SECONDS);
+            }
+        }
+
+        /**
+         * Stops the watchdog if active.
+         */
+        public synchronized void stop() {
+            if (job != null) {
+                job.cancel(true);
+                job = null;
+            }
+        }
+
+        /**
+         * Checks how long it has been since data was last received, and forces a reconnect if it has been too long.
+         */
+        @Override
+        public void run() {
+            long silence = protocol.getMillisSinceLastActivity();
+            if (silence > COMMUNICATION_TIMEOUT_MILLIS) {
+                logger.warn("No data received from the Balboa unit for {} ms, assuming the connection is dead",
+                        silence);
+                // This triggers onStateChange(OFFLINE, ...), which in turn schedules a reconnect.
+                protocol.disconnect();
+            }
         }
     }
 
@@ -229,8 +305,9 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
      */
     @Override
     public void dispose() {
-        // Stop any active polling job
+        // Stop any active polling and watchdog jobs
         pollingJob.stop();
+        watchdogJob.stop();
 
         // Disallow reconnect attempts and disconnect
         reconnectJob.disable();
@@ -264,8 +341,9 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
      */
     @Override
     public void onStateChange(Status status, String detail) {
-        // Stop any active polling job before handling status transitions
+        // Stop any active polling and watchdog jobs before handling status transitions
         pollingJob.stop();
+        watchdogJob.stop();
 
         // Handle the status transition
         switch (status) {
@@ -286,8 +364,12 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
             case OFFLINE:
                 // Schedule a reconnect (nothing will happen if reconnects are disabled)
                 reconnectJob.schedule();
-                // We only update status if we were online (we are in disposal otherwise).
-                if (this.getThing().getStatus() == ThingStatus.ONLINE) {
+                // Avoid spamming the framework with a redundant, identical update on every failed reconnect
+                // attempt once we are already showing OFFLINE. But do report the transition into OFFLINE
+                // whether it came from ONLINE (a real disconnect) or from UNKNOWN (the very first connect
+                // attempt after startup failed) - otherwise a Thing that fails to connect on the first try
+                // would appear stuck on UNKNOWN forever, even while reconnect attempts keep happening.
+                if (this.getThing().getStatus() != ThingStatus.OFFLINE) {
                     updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR, detail);
                     logger.info("Balboa Protocol went Offline");
                 } else {
@@ -297,8 +379,11 @@ public class BalboaHandler extends BaseThingHandler implements Handler {
             case ONLINE:
                 updateStatus(ThingStatus.ONLINE);
                 logger.info("Balboa Protocol is Online");
-                // Start sending poll messages
+                // Reset the reconnect backoff now that the connection is confirmed to be working again
+                reconnectJob.resetBackoff();
+                // Start sending poll messages and watching for the unit going silent
                 pollingJob.start();
+                watchdogJob.start();
                 break;
             default:
                 break;
